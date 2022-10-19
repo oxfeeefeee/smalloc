@@ -3,10 +3,12 @@
 //!  # Usage:
 //!  1. Add this crate as dependency
 //!
-//!  2. Add a dummy feature called "custom-heap":
+//!  2. Add a dummy feature called "custom-heap" in  Cargo.toml:
+//!  ```
 //!  [features]
 //!  default = ["custom-heap"]
 //!  custom-heap = []
+//!  ```
 //!
 //!  3. Put this in your entrypoint.rs
 //! ```

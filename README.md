@@ -1,3 +1,3 @@
 # smalloc
 
-A small and simple memory allocator for Solana programs
+A small memory allocator for Solana programs
