@@ -25,7 +25,6 @@
 //! Note: The "dynamic_start" feature is for unit tests.
 //!
 
-use solana_program::msg;
 use std::{alloc::Layout, cmp, mem::size_of, ptr, ptr::null_mut, usize};
 
 pub struct Smalloc<
@@ -87,7 +86,7 @@ unsafe impl<const START: usize, const LENGTH: usize, const MIN: usize, const PAG
                 inner.alloc_page_for_small(level)
             }
         } else {
-            inner.alloc_n_page_for_big(layout.size())
+            inner.alloc_n_page_for_large(layout.size())
         }
     }
 
@@ -238,7 +237,7 @@ impl<const LENGTH: usize, const MIN: usize, const PAGE_SIZE: usize> Inner<LENGTH
     }
 
     #[inline]
-    fn alloc_n_page_for_big(&self, size: usize) -> *mut u8 {
+    fn alloc_n_page_for_large(&self, size: usize) -> *mut u8 {
         let n = Self::need_page_count(size);
         // Brute force search. TODO: optimize
         unsafe {
@@ -404,10 +403,10 @@ mod test {
             let lo = Layout::from_size_align(16, 8).unwrap();
             for i in 0..2 {
                 dbg!(i);
-                let big_layout = Layout::from_size_align(2 * 1024, 8).unwrap();
+                let large_layout = Layout::from_size_align(2 * 1024, 8).unwrap();
 
-                let big = a.alloc(big_layout);
-                let big2 = a.alloc(big_layout);
+                let large = a.alloc(large_layout);
+                let large2 = a.alloc(large_layout);
                 let p = a.alloc(lo);
                 let p2 = a.alloc(lo);
                 let p3 = a.alloc(lo);
@@ -432,10 +431,10 @@ mod test {
                 assign(p8, 123);
                 assign(p9, 123);
                 assign(p10, 123);
-                a.dealloc(big, big_layout);
-                a.dealloc(big2, big_layout);
+                a.dealloc(large, large_layout);
+                a.dealloc(large2, large_layout);
                 //let pp = a.realloc(p, lo, 64);
-                dbg!(p, p2, p3, p4, p5, p6, p7, p8, p9, p10, big, big2);
+                dbg!(p, p2, p3, p4, p5, p6, p7, p8, p9, p10, large, large2);
             }
         }
     }
