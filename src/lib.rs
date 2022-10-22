@@ -15,143 +15,101 @@
 //! // START: Heap start
 //! // LENGTH: Heap length
 //! // MIN: Minimal allocation size
-//! // MAX: Maximal allocation size
 //! // PAGE_SIZE: Allocation page size
 //! #[cfg(target_os = "solana")]
 //! #[global_allocator]
-//! static ALLOC: Smalloc<{ HEAP_START_ADDRESS as usize }, { HEAP_LENGTH as usize }, 16, 1024, 1024> =
+//! static ALLOC: Smalloc<{ HEAP_START_ADDRESS as usize }, { HEAP_LENGTH as usize }, 16, 1024> =
 //!     Smalloc::new();
 //! ```
 //!
-//! Note: The "with_static" feature is for unit tests.
+//! Note: The "dynamic_start" feature is for unit tests.
 //!
 
+use solana_program::msg;
 use std::{alloc::Layout, cmp, mem::size_of, ptr, ptr::null_mut, usize};
 
 pub struct Smalloc<
     const START: usize,
     const LENGTH: usize,
     const MIN: usize,
-    const MAX: usize,
     const PAGE_SIZE: usize,
 > {
-    #[cfg(feature = "with_static")]
+    #[cfg(feature = "dynamic_start")]
     start: usize,
-    #[cfg(feature = "with_static")]
-    length: usize,
-    #[cfg(feature = "with_static")]
-    min: usize,
-    #[cfg(feature = "with_static")]
-    max: usize,
-    #[cfg(feature = "with_static")]
-    page_size: usize,
 }
 
-impl<
-        const START: usize,
-        const LENGTH: usize,
-        const MIN: usize,
-        const MAX: usize,
-        const PAGE_SIZE: usize,
-    > Smalloc<START, LENGTH, MIN, MAX, PAGE_SIZE>
+impl<const START: usize, const LENGTH: usize, const MIN: usize, const PAGE_SIZE: usize>
+    Smalloc<START, LENGTH, MIN, PAGE_SIZE>
 {
-    #[cfg(not(feature = "with_static"))]
-    pub const fn new() -> Smalloc<START, LENGTH, MIN, MAX, PAGE_SIZE> {
-        checks(START, LENGTH, MIN, MAX, PAGE_SIZE);
+    #[cfg(not(feature = "dynamic_start"))]
+    pub const fn new() -> Smalloc<START, LENGTH, MIN, PAGE_SIZE> {
+        checks(START, LENGTH, MIN, PAGE_SIZE);
         Smalloc {}
     }
 
-    #[cfg(feature = "with_static")]
-    pub fn new(
-        start: usize,
-        length: usize,
-        min: usize,
-        max: usize,
-        page_size: usize,
-    ) -> Smalloc<START, LENGTH, MIN, MAX, PAGE_SIZE> {
-        checks(start, length, min, max, page_size);
-        Smalloc {
-            start,
-            length,
-            min,
-            max,
-            page_size,
-        }
+    #[cfg(feature = "dynamic_start")]
+    pub fn new(start: usize) -> Smalloc<START, LENGTH, MIN, PAGE_SIZE> {
+        checks(start, LENGTH, MIN, PAGE_SIZE);
+        Smalloc { start }
     }
 
     #[inline]
     fn get_start(&self) -> usize {
-        #[cfg(feature = "with_static")]
+        #[cfg(feature = "dynamic_start")]
         let start = self.start;
-        #[cfg(not(feature = "with_static"))]
+        #[cfg(not(feature = "dynamic_start"))]
         let start = START;
 
         start
     }
 }
 
-unsafe impl<
-        const START: usize,
-        const LENGTH: usize,
-        const MIN: usize,
-        const MAX: usize,
-        const PAGE_SIZE: usize,
-    > std::alloc::GlobalAlloc for Smalloc<START, LENGTH, MIN, MAX, PAGE_SIZE>
+unsafe impl<const START: usize, const LENGTH: usize, const MIN: usize, const PAGE_SIZE: usize>
+    std::alloc::GlobalAlloc for Smalloc<START, LENGTH, MIN, PAGE_SIZE>
 {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let start = self.get_start();
         let p = start as *mut usize;
-        let inner = Inner { p };
+        let inner = Inner::<LENGTH, MIN, PAGE_SIZE> { p };
 
         if inner.start() == 0 {
-            #[cfg(feature = "with_static")]
-            let (start, length, min, max, page_size) =
-                (self.start, self.length, self.min, self.max, self.page_size);
-            #[cfg(not(feature = "with_static"))]
-            let (start, length, min, max, page_size) = (START, LENGTH, MIN, MAX, PAGE_SIZE);
-            inner.init(start, length, min, max, page_size)
+            inner.init(self.get_start());
         }
 
         let level = inner.size_level(layout.size());
-        if level > inner.max_level() {
-            return null_mut();
-        }
-
-        let head = inner.free_list(level);
-        // There are free node on the free list
-        if *head != 0 {
-            return Inner::remove_free0(head);
-        }
-
-        // Try allocate new page
-        if inner.page_used() < inner.page_count() {
-            let page_start = inner.start() + inner.page_size() * inner.page_used();
-            let size = 1 << (level + inner.log2_min());
-            let count = inner.page_size() / size;
-            inner.alloc_page(page_start, size, count);
+        if level < Inner::<LENGTH, MIN, PAGE_SIZE>::free_list_count() {
             let head = inner.free_list(level);
-            *head = page_start;
-            return Inner::remove_free0(head);
+            // There are free node on the free list
+            if *head != 0 {
+                Inner::<LENGTH, MIN, PAGE_SIZE>::remove_free0(head)
+            } else {
+                // Try allocate new page
+                inner.alloc_page_for_small(level)
+            }
+        } else {
+            inner.alloc_n_page_for_big(layout.size())
         }
-
-        null_mut()
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if !ptr.is_null() {
-            let inner = Inner {
+            let inner = Inner::<LENGTH, MIN, PAGE_SIZE> {
                 p: self.get_start() as *mut usize,
             };
-            inner.insert_free(ptr, inner.size_level(layout.size()));
+            inner.dealloc(ptr, layout.size());
         }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let inner = Inner {
+        let inner = Inner::<LENGTH, MIN, PAGE_SIZE> {
             p: self.get_start() as *mut usize,
         };
         // The level is not changed, no need to realloc
-        if inner.size_level(layout.size()) == inner.size_level(new_size) {
+        let level = inner.size_level(layout.size());
+
+        if level < Inner::<LENGTH, MIN, PAGE_SIZE>::free_list_count()
+            && level == inner.size_level(new_size)
+        {
             return ptr;
         }
 
@@ -165,54 +123,51 @@ unsafe impl<
     }
 }
 
-struct Inner {
+const FREE_LIST_ADDR: usize = 1;
+
+struct PageHeader {
+    pub used: bool,
+}
+
+struct Inner<const LENGTH: usize, const MIN: usize, const PAGE_SIZE: usize> {
     p: *mut usize,
 }
 
-impl Inner {
+impl<const LENGTH: usize, const MIN: usize, const PAGE_SIZE: usize> Inner<LENGTH, MIN, PAGE_SIZE> {
+    const fn page_size() -> usize {
+        PAGE_SIZE
+    }
+
+    const fn page_count() -> usize {
+        LENGTH / PAGE_SIZE
+    }
+
+    /// log2(min_alloc_size)
+    const fn log2_min() -> usize {
+        round_up_log2(MIN as u32)
+    }
+
+    /// Max sub-page-memory level
+    const fn free_list_count() -> usize {
+        round_up_log2(PAGE_SIZE as u32) - Self::log2_min()
+    }
+
     #[inline]
     fn start(&self) -> usize {
         self.nth_val(0)
     }
 
-    /// log2(min_alloc_size)
-    #[inline]
-    fn log2_min(&self) -> usize {
-        self.nth_val(1)
-    }
-
-    /// Max level, starting from 0
-    #[inline]
-    fn max_level(&self) -> usize {
-        self.nth_val(2)
-    }
-
-    #[inline]
-    fn page_size(&self) -> usize {
-        self.nth_val(3)
-    }
-
-    #[inline]
-    fn page_count(&self) -> usize {
-        self.nth_val(4)
-    }
-
-    #[inline]
-    fn page_used(&self) -> usize {
-        self.nth_val(5)
-    }
-
-    #[inline]
-    fn page_used_inc(&self) {
-        unsafe {
-            *self.nth_ptr(5) = self.page_used() + 1;
-        }
-    }
-
     /// The linked lists of free memory for each size level
     #[inline]
     fn free_list(&self, level: usize) -> *mut usize {
-        self.nth_ptr(6 + level)
+        self.nth_ptr(FREE_LIST_ADDR + level)
+    }
+
+    #[inline]
+    fn page_header(&self, index: usize) -> *mut PageHeader {
+        // Right after free list
+        let begin_addr = self.free_list(Self::free_list_count()) as *mut PageHeader;
+        unsafe { begin_addr.add(index) }
     }
 
     #[inline]
@@ -225,43 +180,114 @@ impl Inner {
         unsafe { *self.nth_ptr(n) }
     }
 
+    /// Init inner structure, we assume the memory is zeroed
     #[inline]
-    unsafe fn init(&self, start: usize, length: usize, min: usize, max: usize, page_size: usize) {
-        let log2_min = round_up_log2(min as u32);
-        let log2_max = round_up_log2(max as u32);
-        let max_level = log2_max - log2_min;
-
+    unsafe fn init(&self, start: usize) {
         *self.nth_ptr(0) = start;
-        *self.nth_ptr(1) = log2_min;
-        *self.nth_ptr(2) = max_level;
-        *self.nth_ptr(3) = page_size;
-        *self.nth_ptr(4) = length / page_size;
-        *self.nth_ptr(5) = 0;
-
-        let block_size: usize = cmp::max(min, size_of::<usize>());
-        let used_count = 6 + self.max_level() + 1;
-        let start = self.start() + used_count * block_size;
-        let block_count = self.page_size() / block_size - used_count;
         // Allocate the first page and spare space for the Inner
-        self.alloc_page(start, block_size, block_count);
+        self.alloc_page_for_small(self.size_level(MIN));
 
-        // init free-list-heads
-        for i in 0..(self.max_level() + 1) {
+        // Write start again, as it was overwritten by alloc_page_for_small
+        *self.nth_ptr(0) = start;
+        // Init free-list-heads
+        for i in 0..Self::free_list_count() {
             *self.free_list(i) = 0;
         }
-        *self.free_list(self.size_level(block_size)) = start;
+        // Set the first free memory block
+        let mut inner_data_end = self.page_header(Self::page_count()) as usize;
+
+        if inner_data_end % MIN != 0 {
+            inner_data_end += MIN - (inner_data_end % MIN);
+        }
+        dbg!(self.start() as *mut u8);
+        assert!(inner_data_end < self.start() + Self::page_size());
+        *self.free_list(0) = inner_data_end;
     }
 
     #[inline]
-    unsafe fn alloc_page(&self, page_start: usize, size: usize, count: usize) {
-        for i in 0..(count - 1) {
-            let p = (page_start + (size * i)) as *mut usize;
-            *p = page_start + (size * (i + 1));
+    unsafe fn alloc_page_for_small(&self, level: usize) -> *mut u8 {
+        let size = 1 << (level + Inner::<LENGTH, MIN, PAGE_SIZE>::log2_min());
+        let mut page_index = None;
+        for i in 0..Self::page_count() {
+            let header = self.page_header(i).as_mut().unwrap();
+            if !header.used {
+                page_index = Some(i);
+                header.used = true;
+                break;
+            }
         }
-        let ptr_end = (page_start + (count - 1) * size) as *mut usize;
-        *ptr_end = 0;
 
-        self.page_used_inc();
+        match page_index {
+            Some(i) => {
+                let page_start = self.start() + i * Self::page_size();
+                let count = Self::page_size() / size;
+                for i in 0..(count - 1) {
+                    let p = (page_start + (size * i)) as *mut usize;
+                    *p = page_start + (size * (i + 1));
+                }
+                let ptr_end = (page_start + (count - 1) * size) as *mut usize;
+                *ptr_end = 0;
+
+                let head = self.free_list(level);
+                *head = page_start;
+
+                Self::remove_free0(head)
+            }
+            None => null_mut(),
+        }
+    }
+
+    #[inline]
+    fn alloc_n_page_for_big(&self, size: usize) -> *mut u8 {
+        let n = Self::need_page_count(size);
+        // Brute force search. TODO: optimize
+        unsafe {
+            let first_posible_begin = Self::page_count() - n;
+            for i in 0..(Self::page_count() - n) {
+                let begin = first_posible_begin - i;
+                let mut ok = true;
+                for j in 0..n {
+                    if (*self.page_header(begin + j)).used {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    for j in 0..n {
+                        let header = &mut (*self.page_header(begin + j));
+                        header.used = true;
+                    }
+                    return (self.start() + begin * Self::page_size()) as *mut u8;
+                }
+            }
+        }
+
+        null_mut()
+    }
+
+    #[inline]
+    unsafe fn dealloc(&self, ptr: *mut u8, size: usize) {
+        let level = self.size_level(size);
+        if level < Inner::<LENGTH, MIN, PAGE_SIZE>::free_list_count() {
+            self.insert_free(ptr, level);
+        } else {
+            let loc = ptr as usize - self.start();
+            assert!(loc % Self::page_size() == 0);
+            let index = loc / Self::page_size();
+            let n = Self::need_page_count(size);
+            for i in index..(index + n) {
+                (*self.page_header(i)).used = false;
+            }
+        }
+    }
+
+    #[inline]
+    fn need_page_count(size: usize) -> usize {
+        if size % Self::page_size() == 0 {
+            size / Self::page_size()
+        } else {
+            size / Self::page_size() + 1
+        }
     }
 
     #[inline]
@@ -283,12 +309,12 @@ impl Inner {
     #[inline]
     fn size_level(&self, size: usize) -> usize {
         let log2 = round_up_log2(size as u32);
-        let log2_min = self.log2_min();
+        let log2_min = Self::log2_min();
         cmp::max(log2, log2_min) - log2_min
     }
 }
 
-const fn checks(start: usize, length: usize, min: usize, max: usize, page_size: usize) {
+const fn checks(start: usize, length: usize, min: usize, page_size: usize) {
     // 0 is used as a marker
     assert!(start > 0);
     // support size up to u32::MAX
@@ -298,11 +324,7 @@ const fn checks(start: usize, length: usize, min: usize, max: usize, page_size: 
 
     assert!(min >= size_of::<usize>());
     assert!(round_up_to_power2(min as u32) == min as u32);
-    assert!(round_up_to_power2(max as u32) == max as u32);
-    assert!(max >= min);
-    assert!(max <= page_size && page_size % max == 0);
-    // Big enough to store inner data
-    assert!(page_size / min >= 32);
+    assert!(min <= page_size && page_size % min == 0);
 }
 
 const fn round_up_to_power2(size: u32) -> u32 {
@@ -365,24 +387,27 @@ mod test {
     #[test]
     fn test_alloc() {
         unsafe {
-            let length = 256 * 1024;
-            let min = 8;
-            let max = 1024;
-            let page_size = 1024;
+            const length: usize = 256 * 1024;
+            const min: usize = 16;
+            const page_size: usize = 2048;
             let mem = std::alloc::alloc(Layout::from_size_align(512 * 1024, page_size).unwrap());
             let start = mem as usize;
             let end = mem.add(length);
 
             dbg!(super::round_up_log2(min as u32));
 
-            let max_level = max_level(min, max);
-            let real_star_8 = (start + (6 + max_level + 1) * min) as *mut u8;
+            let max_level = max_level(min, page_size);
+            let real_star_8 = (start + (super::FREE_LIST_ADDR + max_level + 1) * min) as *mut u8;
             dbg!(mem, end, max_level, real_star_8);
 
-            let a = Smalloc::<0, 0, 0, 0, 0>::new(start, length, min, max, page_size);
-            let lo = Layout::from_size_align(8, 8).unwrap();
-            for i in 0..250 {
+            let a = Smalloc::<0, length, min, page_size>::new(start);
+            let lo = Layout::from_size_align(16, 8).unwrap();
+            for i in 0..2 {
                 dbg!(i);
+                let big_layout = Layout::from_size_align(2 * 1024, 8).unwrap();
+
+                let big = a.alloc(big_layout);
+                let big2 = a.alloc(big_layout);
                 let p = a.alloc(lo);
                 let p2 = a.alloc(lo);
                 let p3 = a.alloc(lo);
@@ -407,8 +432,10 @@ mod test {
                 assign(p8, 123);
                 assign(p9, 123);
                 assign(p10, 123);
+                a.dealloc(big, big_layout);
+                a.dealloc(big2, big_layout);
                 //let pp = a.realloc(p, lo, 64);
-                dbg!(p, p2, p3, p4, p5, p6, p7, p8, p9, p10);
+                dbg!(p, p2, p3, p4, p5, p6, p7, p8, p9, p10, big, big2);
             }
         }
     }
